@@ -28,7 +28,7 @@ concurrency:
 jobs:
   build_push:
     name: Build and push image
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
 
     permissions:
       contents: read
@@ -36,6 +36,14 @@ jobs:
       id-token: write
 
     steps:
+      - name: Pre-build cleanup
+        run: |
+          echo "Cleaning up before build..."
+          podman system prune -af --volumes || true
+          buildah rm --all || true
+          df -h
+          echo "Cleanup complete"
+
       - name: Prepare environment
         run: |
           # Lowercase the image uri
@@ -186,3 +194,12 @@ jobs:
           TAGS: ${{ steps.push.outputs.digest }}
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+
+      - name: Post-build cleanup
+        if: always()
+        run: |
+          echo "Cleaning up after build..."
+          podman system prune -af --volumes || true
+          buildah rm --all || true
+          df -h
+          echo "Cleanup complete"

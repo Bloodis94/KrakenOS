@@ -4,30 +4,48 @@ name: Build disk images
 on:
   workflow_dispatch:
     inputs:
+      de:
+        description: "The DE for which you want to build the ISO"
+        required: true
+        type: choice
+        options:
+          - sway
       upload-to-s3:
         description: "Upload to S3"
         required: false
         default: false
         type: boolean
       platform:
+        description: "The platform for which you want to build the ISO"
         required: true
         type: choice
         options:
           - amd64
           - arm64
+  # Run automatically after the container image build workflow completes successfully
+  workflow_run:
+    workflows: ["Build container image"]
+    types: [completed]
+    branches:
+      - main
   pull_request:
     branches:
       - main
     paths:
       - './disk_config/disk.toml'
-      - './disk_config/iso.toml'
+      - './disk_config/iso-sway.toml'
       - './.github/workflows/build-disk.yml'
 
 env:
   IMAGE_NAME: ${{ github.event.repository.name }} # output of build.yml, keep in sync
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"  # do not edit
+  # Provide sensible defaults for both manual and workflow_run triggers
+  DE_VERSION: ${{ inputs.de || 'sway' }}
+  PLATFORM: ${{ inputs.platform || 'amd64' }}
+  UPLOAD_TO_S3: ${{ inputs['upload-to-s3'] || false }}
+  ISO_PATH: "./disk_config/iso-"
   DEFAULT_TAG: "latest"
-  BIB_IMAGE: "ghcr.io/lorbuschris/bootc-image-builder:20250608" # "quay.io/centos-bootc/bootc-image-builder:latest" - see https://github.com/osbuild/bootc-image-builder/pull/954
+  BIB_IMAGE: "ghcr.io/osbuild/bootc-image-builder:latest" # "quay.io/centos-bootc/bootc-image-builder:latest" - see https://github.com/osbuild/bootc-image-builder/pull/954
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
@@ -36,11 +54,15 @@ concurrency:
 jobs:
   build:
     name: Build disk images
-    runs-on: ${{ inputs.platform == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    # Default to amd64 (self-hosted) unless explicitly overridden
+    runs-on: ${{ (inputs.platform || 'amd64') == 'amd64' && 'self-hosted' || 'ubuntu-24.04-arm' }}
+    # Only proceed automatically when the upstream workflow succeeded
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
-        disk-type: ["qcow2", "anaconda-iso"]
+        #disk-type: ["qcow2", "anaconda-iso"]
+        disk-type: ["anaconda-iso"]
     permissions:
       contents: read
       packages: read
@@ -59,47 +81,51 @@ jobs:
           echo "DISK_TYPE=${DISK_TYPE}" >> ${GITHUB_ENV}
           echo "USER_UID=${USER_UID}" >> ${GITHUB_ENV}
           echo "USER_GID=${USER_GID}" >> ${GITHUB_ENV}
+          echo "${{ github.token }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Compute ISO_DE_PATH
+        run: |
+          echo "ISO_DE_PATH=${ISO_PATH}${DE_VERSION}.toml" >> $GITHUB_ENV
 
       - name: Install dependencies
-        if: inputs.platform == 'arm64'
+        if: ${{ (inputs.platform || 'amd64') == 'arm64' }}
         run: |
           set -x
           sudo apt update -y
           sudo apt install -y \
             podman
 
-      - name: Maximize build space
-        if: inputs.platform != 'arm64'
-        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
-        with:
-          remove-codeql: true
-
       - name: Checkout
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6
+
+      - name: Pull base image
+        run: |
+          sudo podman pull "${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}"
 
       - name: Build disk images
         id: build
         uses: osbuild/bootc-image-builder-action@main
         with:
           builder-image: ${{ env.BIB_IMAGE }}
-          config-file: ${{ matrix.disk-type == 'anaconda-iso' && './disk_config/iso.toml' || './disk_config/disk.toml' }}
+          config-file: ${{ matrix.disk-type == 'anaconda-iso' && env.ISO_DE_PATH || './disk_config/disk.toml' }}
           image: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
           chown: ${{ env.USER_UID }}:${{ env.USER_GID }}
           types: ${{ matrix.disk-type }}
-          additional-args: --use-librepo=True
+          additional-args: --use-librepo=True --rootfs=ext4
 
-      - name: Upload disk images and Checksum to Job Artifacts
-        if: inputs.upload-to-s3 != true && github.event_name != 'pull_request'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          path: ${{ steps.build.outputs.output-directory }}
-          if-no-files-found: error
-          retention-days: 0
-          compression-level: 0
-          overwrite: true
+#      - name: Upload disk images and Checksum to Job Artifacts
+#        if: ${{ (inputs['upload-to-s3'] || false) != true && github.event_name != 'pull_request' }}
+#        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+#        with:
+#          name: ${{ matrix.disk-type == 'anaconda-iso' && 'iso' || 'qcow' }}
+#          path: ${{ steps.build.outputs.output-directory }}
+#          if-no-files-found: error
+#          retention-days: 0
+#          compression-level: 0
+#          overwrite: true
       
       - name: Upload to S3
-        if: inputs.upload-to-s3 == true && github.event_name != 'pull_request'
+        if: ${{ (inputs['upload-to-s3'] || false) == true && github.event_name != 'pull_request' }}
         shell: bash
         env:
           RCLONE_CONFIG_S3_TYPE: s3
